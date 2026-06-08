@@ -1,0 +1,297 @@
+---
+title: "preprocess"
+format: html
+---
+
+```{r}
+# Loading in packages.
+library(data.table)
+library(RcppSimdJson)
+library(here)
+library(fst)
+library(janitor)
+```
+
+Reading players data, dropping columns that won't be used for the analysis. 
+```{r}
+players <- data.table::as.data.table(RcppSimdJson::fload(here("data", "players.json")))
+player_rankings <- data.table::as.data.table(RcppSimdJson::fload(here("data", "playerank.json")))
+
+players <- data.table::merge.data.table(x = player_rankings, y = players, by.x = c('playerId'), by.y = c('wyId'))
+player_rankings <- NULL
+gc()
+
+drop_cols <- c(
+  "passportArea", "weight", "birthArea", "height",
+  "shortName", "birthDate", "role", 'currentNationalTeamId', 'currentTeamId'
+)
+keep_cols <- setdiff(colnames(players), drop_cols)
+players <- players[, ..keep_cols]
+```
+
+```{r}
+leagues <- c("England", "France", "Germany", "Italy", "Spain", "World_Cup", "European_Championship")
+```
+
+
+```{r}
+matches_loc <- here::here("data", "matches")
+
+matches <- data.table::rbindlist(lapply(leagues, function(league) {
+  dt <- data.table::as.data.table(
+    RcppSimdJson::fload(file.path(matches_loc, paste0("matches_", league, ".json")))
+  )
+  dt[, league := league]
+}), fill = TRUE)
+```
+
+```{r}
+matches[, groupName := NULL]
+```
+
+```{r}
+drop_cols <- c("roundId", "referees", "competitionId", "groupName", "winner", "venue", "status", "label")
+keep_cols <- setdiff(colnames(matches), drop_cols)
+
+matches <- matches[, ..keep_cols]
+
+setnames(matches, 
+  c('wyId'), c('matchId')
+)
+```
+
+`recent_player strength:` Exponentially weighted moving average of player performance. 
+
+
+```{r}
+players <- data.table::merge.data.table(x = matches[, c("dateutc", "matchId")], y = players, by.x = "matchId", by.y = "matchId", all.y = TRUE)
+```
+
+```{r}
+players[, dateutc := as.POSIXct(dateutc, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+
+setorder(players, playerId, dateutc)
+```
+
+```{r}
+alpha <- 0.3
+
+players[, ewma_rank := {
+  ewma <- Reduce(
+    function(acc, x) alpha * x + (1 - alpha) * acc,
+    playerankScore,
+    accumulate = TRUE
+  )
+  shifted <- shift(ewma, n = 1)
+}, by = playerId]
+```
+
+```{r}
+players[, is_debut := is.na(ewma_rank)]
+```
+
+
+```{r}
+# see how quickly different alphas decay
+alphas <- c(0.1, 0.3, 0.5, 0.7)
+decay <- sapply(alphas, function(a) a * (1 - a)^(0:15))
+
+matplot(decay,
+  type = "l", lty = 1,
+  xlab = "Games ago", ylab = "Weight",
+  main = "EWMA decay by alpha"
+)
+legend("topright", legend = paste("alpha =", alphas), col = 1:4, lty = 1)
+```
+
+
+
+```{r}
+compute_team_strength <- function(lineup, matchId, side) {
+  lineup$matchId <- matchId
+  lineup <- data.table::merge.data.table(
+    x = lineup,
+    y = players[, c("playerId", "matchId", "ewma_rank")],
+    by.x = c("playerId", "matchId"),
+    by.y = c("playerId", "matchId")
+  )
+
+  if (side == "home") {
+    if (sum(is.na(lineup)) > 3) {
+      return(list(
+        matchId = matchId,
+        homeMeanStr = NA_real_,
+        homeMinStr = NA_real_,
+        homeMaxStr = NA_real_,
+        homeBalance = NA_real_
+      ))
+    }
+    return(list(
+      matchId = matchId,
+      homeMeanStr = mean(lineup$ewma_rank, na.rm = TRUE),
+      homeMinStr = min(lineup$ewma_rank, na.rm = TRUE),
+      homeMaxStr = max(lineup$ewma_rank, na.rm = TRUE),
+      homeBalance = sd(lineup$ewma_rank, na.rm = TRUE)
+    ))
+  } else {
+    if (sum(is.na(lineup)) > 3) {
+      return(list(
+        matchId = matchId,
+        awayMeanStr = NA_real_,
+        awayMinStr = NA_real_,
+        awayMaxStr = NA_real_,
+        awayBalance = NA_real_
+      ))
+    }
+    return(list(
+      matchId = matchId,
+      awayMeanStr = mean(lineup$ewma_rank, na.rm = TRUE),
+      awayMinStr = min(lineup$ewma_rank, na.rm = TRUE),
+      awayMaxStr = max(lineup$ewma_rank, na.rm = TRUE),
+      awayBalance = sd(lineup$ewma_rank, na.rm = TRUE)
+    ))
+  }
+}
+
+# initialise new columns
+matches[, homeId := NA_real_]
+matches[, homeMeanStr := NA_real_]
+matches[, homeMinStr := NA_real_]
+matches[, homeMaxStr := NA_real_]
+matches[, homeBalance := NA_real_]
+matches[, awayId := NA_real_]
+matches[, awayMeanStr := NA_real_]
+matches[, awayMinStr := NA_real_]
+matches[, awayMaxStr := NA_real_]
+matches[, awayBalance := NA_real_]
+for (i in seq_len(nrow(matches))) {
+  match_idx <- matches$matchId[i]
+  td <- matches$teamsData[[i]]
+  home_idx <- which(sapply(td, function(x) x$side) == "home")
+  away_idx <- which(sapply(td, function(x) x$side) == "away")
+
+  home_result <- compute_team_strength(td[[home_idx]]$formation$lineup, match_idx, td[[home_idx]]$side)
+  away_result <- compute_team_strength(td[[away_idx]]$formation$lineup, match_idx, td[[away_idx]]$side)
+  matches[matchId == match_idx, 'homeId' := td[[home_idx]]$teamId]
+  matches[matchId == match_idx, "homeMeanStr" := home_result$homeMeanStr]
+  matches[matchId == match_idx, "homeMinStr" := home_result$homeMinStr]
+  matches[matchId == match_idx, "homeMaxStr" := home_result$homeMaxStr]
+  matches[matchId == match_idx, "homeBalance" := home_result$homeBalance]
+  matches[matchId == match_idx, 'awayId' := td[[away_idx]]$teamId]
+  matches[matchId == match_idx, "awayMeanStr" := away_result$awayMeanStr]
+  matches[matchId == match_idx, "awayMinStr" := away_result$awayMinStr]
+  matches[matchId == match_idx, "awayMaxStr" := away_result$awayMaxStr]
+  matches[matchId == match_idx, "awayBalance" := away_result$awayBalance]
+}
+```
+
+
+
+
+```{r}
+events_loc <- here::here("data", "events")
+
+events <- data.table::rbindlist(lapply(leagues, function(league) {
+  dt <- data.table::as.data.table(
+    RcppSimdJson::fload(file.path(events_loc, paste0("events_", league, ".json")))
+  )
+  dt[, league := league]
+}), fill = TRUE)
+```
+
+```{r}
+events <- merge.data.table(x = events, y = players, by = c("playerId", "matchId"), all.x = TRUE)
+```
+
+
+```{r}
+# teamsData is a list column - unnest it
+teams_long <- data.table::rbindlist(lapply(seq_len(nrow(matches)), function(i) {
+  td <- matches$teamsData[[i]]
+  data.table::rbindlist(lapply(seq_along(td), function(j) {
+    list(
+      matchId = matches$matchId[i],
+      teamId = td[[j]]$teamId,
+      side = td[[j]]$side,
+      score = td[[j]]$score
+    )
+  }))
+}))
+```
+
+something I should do is probably do is back cast player performance. Also I need to get an overall picture of team performance as well. I'll take a mean of player rank, though this might not be optimal.
+```{r}
+home <- teams_long[side == "home"]
+away <- teams_long[side == "away"]
+
+setnames(home,
+  old = c("teamId", "score", "side"),
+  new = c("homeTeamId", "homeScore", "homeSide")
+)
+setnames(away,
+  old = c("teamId", "score", "side"),
+  new = c("awayTeamId", "awayScore", "awaySide")
+)
+
+matches_wide <- data.table::merge.data.table(
+  x = home,
+  y = away,
+  by = "matchId"
+)
+
+matches_wide <- data.table::merge.data.table(
+  x = matches_wide,
+  y = matches,
+  by = "matchId"
+)
+```
+
+```{r}
+events <- data.table::merge.data.table(
+  x = events, y = matches, by.x = c("matchId", "league"), by.y = c("matchId", "league"), all.x = TRUE
+)
+```
+
+```{r}
+events[, is_Home := (teamId == homeId)]
+```
+
+```{r}
+events[, `:=`(
+  pos_orig_x = sapply(positions, function(p) if (nrow(p) >= 1) p$x[1] else NA_real_),
+  pos_orig_y = sapply(positions, function(p) if (nrow(p) >= 1) p$y[1] else NA_real_),
+  pos_dest_x = sapply(positions, function(p) if (nrow(p) >= 2) p$x[2] else NA_real_),
+  pos_dest_y = sapply(positions, function(p) if (nrow(p) >= 2) p$y[2] else NA_real_)
+)]
+```
+
+```{r}
+corner_x <- c(0, 100)
+corner_y <- c(0, 100)
+events[
+  eventName == "Free Kick" &
+    pos_orig_x %in% corner_x &
+    pos_orig_y %in% corner_y,
+  eventName := "Corner Kick"
+]
+```
+
+```{r}
+setDT(events)
+events[, `:=`(
+  goal = sapply(tags, function(x) any(x$id == 101)),
+  own_goal = sapply(tags, function(x) any(x$id == 102))
+)]
+```
+
+```{r}
+events[, dateutc.x := NULL]
+setnames(events, 'dateutc.y', 'dateutc')
+events[, c('roleCluster', 'playerankScore', 'firstName', 'middleName', 'lastName', 'foot', 'minutesPlayed', 'teamsData', 'positions', 'seasonId', 'date', 'duration', 'eventId', 'playerId', 'teamId', 'id', 'gameweek', 'goalScored', 'tags') := NULL]
+
+```
+
+
+```{r}
+fst::write.fst(events, 'events_processed.fst')
+```

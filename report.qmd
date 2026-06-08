@@ -1,0 +1,454 @@
+---
+title: "In-Play Soccer Goal Prediction"
+author: "Simran Bilkhu"
+date: today
+format:
+  pdf:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-overflow: 'wrap'
+    code-summary: "Show code"
+    fig-cap-location: bottom
+    self-contained: true
+execute:
+  echo: true
+  eval: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| eval: true
+#| echo: false
+library(knitr)
+library(here)
+```
+
+# Introduction
+
+This project is in progress!!! It's a starting point for further research. Here is a brief summary:
+
+- **Goal:** baseline GAM predicting home and away goals remaining as a function of match state. In particular, so that I have reasonable model to compare for extending the Cox-process framework of [Maia et al. (2023)](https://arxiv.org/abs/2312.04338), wherein each event type is modelled via its own Poisson random measure.
+- **Data:** 3.2 million observations, 45 predictors, seven competitions (England, France, Germany, Italy, Spain, World Cup, European Championship) from the [Wyscout public dataset](https://figshare.com/collections/Soccer_match_event_dataset/4415000)
+- **Predictors:** cumulative event counts, live score, match time, pitch position, PlayeRank performance ratings
+- **Extension:** [Maia et al. (2023)](https://arxiv.org/abs/2312.04338) use market value as a proxy for team strength. I would like we replace this with [PlayeRank-based](https://github.com/mesosbrodleto/playerank) measures, reweighting event counts by the strength of the player performing them
+
+# Data
+
+## Data Sources
+
+Four raw data sources are joined:
+
+-   **`players.json`** — player metadata (name, nationality, preferred foot, etc.)
+-   **`playerank.json`** — per-match player performance ratings (`playerankScore`)
+-   **`matches_{league}.json`** — match metadata and team lineups (one file per competition)
+-   **`events_{league}.json`** — full event logs (one file per competition)
+
+After preprocessing, we are left with over `3` million observations with the following 43 variables are used to model the response:  `league`, `match_period`, `event_sec`, `sub_event_id`, `ewma_rank`, `dateutc`, `home_mean_str`, `home_min_str`, `home_max_str`, `home_balance`, `away_mean_str`, `away_min_str`, `away_max_str`, `away_balance`, `pos_orig_x`, `pos_orig_y`, `pos_dest_x`, `pos_dest_y`, `own_goal`, `count_home_others_on_the_ball`, `count_home_pass`, `count_home_duel`, `count_home_foul`, `count_home_free_kick`, `count_home_shot`, `count_home_offside`, `count_away_others_on_the_ball`, `count_away_duel`, `count_away_shot`, `count_away_pass`, `count_away_foul`, `count_away_free_kick`, `count_home_corner_kick`, `count_away_corner_kick`, `count_away_offside`, `current_home_score`, `current_away_score`.
+
+The responses are `home_goals_remaining`, and `away_goals_remaining`.
+
+Refer to `preprocess.R` and `state_of_play.R` for details.
+
+
+## Details on some predictors
+
+### Player Strength: EWMA of Performance Rating
+
+To capture player strength, we took a weighted average of recent player performance (measured by `playerankScore` - see [PlayeRank](https://github.com/mesosbrodleto/playerank)). Specifically, we took an *exponentially weighted moving average* (EWMA) of recent rankings:
+
+$$\hat{r}_t = \alpha \cdot r_t + (1 - \alpha) \cdot \hat{r}_{t-1}$$
+
+where $r_t$ is the player's rating in match $t$ and $\alpha = 0.3$ was chosen to weight roughly the last 3–5 matches meaningfully.
+
+```{r ewma}
+alpha <- 0.3
+
+players[, ewma_rank := {
+  ewma    <- Reduce(function(acc, x) alpha * x + (1 - alpha) * acc,
+                   playerankScore, accumulate = TRUE)
+  shift(ewma, n = 1)   # lag by 1: only use past form, not current match
+}, by = playerId]
+
+players[, is_debut := is.na(ewma_rank)]
+```
+
+The chart below shows how quickly each $\alpha$ decays, for different `alpha`
+
+```{r ewma-decay-plot}
+#| eval: true
+#| echo: false
+#| fig-cap: "Weight assigned to each prior game under different EWMA decay rates. 0.3 (orange) is the chosen value."
+knitr::include_graphics(here("plots", "ewma_decay.png"))
+```
+
+### Team Strength Features
+
+For each match, lineup-level EWMA ratings are aggregated into four team-level features using the starting eleven:
+
+| Feature              | Description                        |
+|----------------------|------------------------------------|
+| `{home,away}MeanStr` | Mean EWMA rank across all starters |
+| `{home,away}MinStr`  | Minimum (weakest player)           |
+| `{home,away}MaxStr`  | Maximum (strongest player)         |
+| `{home,away}Balance` | Standard deviation (balance)       |
+
+If more than 3 players in a lineup are missing EWMA values, all four features for that team are set to `NA`.
+
+```{r team-strength}
+#| eval: false
+#| echo: false
+compute_team_strength <- function(lineup, matchId, side) {
+  lineup$matchId <- matchId
+  lineup <- data.table::merge.data.table(
+    x = lineup,
+    y = players[, c("playerId", "matchId", "ewma_rank")],
+    by.x = c("playerId", "matchId"),
+    by.y = c("playerId", "matchId")
+  )
+
+  if (side == "home") {
+    if (sum(is.na(lineup)) > 3) {
+      return(list(
+        matchId = matchId,
+        homeMeanStr = NA_real_,
+        homeMinStr = NA_real_,
+        homeMaxStr = NA_real_,
+        homeBalance = NA_real_
+      ))
+    }
+    return(list(
+      matchId = matchId,
+      homeMeanStr = mean(lineup$ewma_rank, na.rm = TRUE),
+      homeMinStr = min(lineup$ewma_rank, na.rm = TRUE),
+      homeMaxStr = max(lineup$ewma_rank, na.rm = TRUE),
+      homeBalance = sd(lineup$ewma_rank, na.rm = TRUE)
+    ))
+  } else {
+    if (sum(is.na(lineup)) > 3) {
+      return(list(
+        matchId = matchId,
+        awayMeanStr = NA_real_,
+        awayMinStr = NA_real_,
+        awayMaxStr = NA_real_,
+        awayBalance = NA_real_
+      ))
+    }
+    return(list(
+      matchId = matchId,
+      awayMeanStr = mean(lineup$ewma_rank, na.rm = TRUE),
+      awayMinStr = min(lineup$ewma_rank, na.rm = TRUE),
+      awayMaxStr = max(lineup$ewma_rank, na.rm = TRUE),
+      awayBalance = sd(lineup$ewma_rank, na.rm = TRUE)
+    ))
+  }
+}
+
+# initialise new columns
+matches[, homeId := NA_real_]
+matches[, homeMeanStr := NA_real_]
+matches[, homeMinStr := NA_real_]
+matches[, homeMaxStr := NA_real_]
+matches[, homeBalance := NA_real_]
+matches[, awayId := NA_real_]
+matches[, awayMeanStr := NA_real_]
+matches[, awayMinStr := NA_real_]
+matches[, awayMaxStr := NA_real_]
+matches[, awayBalance := NA_real_]
+for (i in seq_len(nrow(matches))) {
+  match_idx <- matches$matchId[i]
+  td <- matches$teamsData[[i]]
+  home_idx <- which(sapply(td, function(x) x$side) == "home")
+  away_idx <- which(sapply(td, function(x) x$side) == "away")
+
+  home_result <- compute_team_strength(td[[home_idx]]$formation$lineup, match_idx, td[[home_idx]]$side)
+  away_result <- compute_team_strength(td[[away_idx]]$formation$lineup, match_idx, td[[away_idx]]$side)
+  matches[matchId == match_idx, 'homeId' := td[[home_idx]]$teamId]
+  matches[matchId == match_idx, "homeMeanStr" := home_result$homeMeanStr]
+  matches[matchId == match_idx, "homeMinStr" := home_result$homeMinStr]
+  matches[matchId == match_idx, "homeMaxStr" := home_result$homeMaxStr]
+  matches[matchId == match_idx, "homeBalance" := home_result$homeBalance]
+  matches[matchId == match_idx, 'awayId' := td[[away_idx]]$teamId]
+  matches[matchId == match_idx, "awayMeanStr" := away_result$awayMeanStr]
+  matches[matchId == match_idx, "awayMinStr" := away_result$awayMinStr]
+  matches[matchId == match_idx, "awayMaxStr" := away_result$awayMaxStr]
+  matches[matchId == match_idx, "awayBalance" := away_result$awayBalance]
+}
+```
+
+### Spatial Position
+
+The `x` coordinates represent closeness to the defending teams goal (`100` meaning you would have scored a touchdown in another sport). 
+
+The `y` coordinate represents nearness to the right side of the pitch, from the perspective of the attacking team. 
+
+To make it so that the perspective is from the home team, we reflected the x and y coordinates for away events.
+
+```{r}
+df[!df$is_home, pos_orig_x := -pos_orig_x + 100]
+df[!df$is_home, pos_orig_y := -pos_orig_y + 100]
+df[!df$is_home, pos_dest_x := -pos_dest_x + 100]
+df[!df$is_home, pos_dest_y := -pos_dest_y + 100]
+```
+
+### Corner Kick
+
+The raw data labels corner kicks as "Free Kick". Corner kicks are identified by their origin being exactly at a pitch corner `((0,0), (0,100), (100,0),` or `(100,100))`:
+
+```{r corners}
+corner_x <- c(0, 100)
+corner_y <- c(0, 100)
+events[
+  eventName == "Free Kick" & pos_orig_x %in% corner_x & pos_orig_y %in% corner_y,
+  eventName := "Corner Kick"
+]
+```
+
+### Goal Tagging
+
+Goals and own goals are encoded in the event `tags` column as integer IDs. They are extracted into Boolean columns:
+
+```{r goals}
+events[, `:=`(
+  goal = sapply(tags, function(x) any(x$id == 101)),
+  own_goal = sapply(tags, function(x) any(x$id == 102))
+)]
+```
+
+The preprocessed event table is saved to `events_processed.fst` for downstream use.
+
+
+### Events not counted
+
+Three event types are removed since no playerId was assigned to them. Imputation doesn't make sense since imputing player strength metrics isn't meaningful for Interruptions, and the way playrank is computed doesn't apply well to goal keepers. 
+
+```{r filter-events}
+#| eval: true
+#| echo: false
+#| fig-cap: "Proportion of non-debut players with missing EWMA rank, by event type. Events with structurally high missingness (Interruption, Goalkeeper leaving line, Save attempt) are removed."
+knitr::include_graphics(here("plots", "ewma_missing_by_event.png"))
+```
+
+### Response + Current Score
+
+The live score at each moment in the match is tracked by cumulating goals (and own goals, which count for the opposing side):
+
+```{r score}
+df[, `:=`(
+  current_home_score = cumsum(fifelse(is_home,  goal * 1L, 0L)) +
+                       cumsum(fifelse(!is_home, own_goal * 1L, 0L)),
+  current_away_score = cumsum(fifelse(!is_home, goal * 1L, 0L)) +
+                       cumsum(fifelse(is_home,  own_goal * 1L, 0L))
+), by = c("match_id", "dateutc")]
+```
+
+**Goals remaining** (the response variable) is then:
+
+```{r remaining}
+df[, `:=`(
+  home_goals_remaining = sum(fifelse(is_home,  goal * 1L, 0L)) +
+  sum(fifelse(!is_home, own_goal * 1L, 0L)) - current_home_score,
+  away_goals_remaining = sum(fifelse(!is_home, goal * 1L, 0L)) +
+   sum(fifelse(is_home,  own_goal * 1L, 0L)) - current_away_score
+), by = match_id]
+```
+
+
+# Temporal Train/Test Split & Cross-Validation (for future use)
+
+## Train/Test Split
+
+To respect the temporal ordering of matches, the data is split **per league** at the 80th percentile of match date:
+
+```{r split}
+cutoff <- df |>
+  group_by(league) |>
+  summarise(cutoff = quantile(dateutc, 0.8), .groups = "drop")
+
+train <- df |> filter(dateutc <= cutoff)
+test  <- df |> filter(dateutc >  cutoff)
+```
+
+
+
+## Walk-Forward Cross-Validation
+NOTE!!! These folds will be used for further analysis. 
+
+Within the training set, I used a sliding window CV scheme. Folds are built using a rolling 3-month look back with a 1-month assessment window, separately per league:
+
+```{r cv-folds}
+cv_folds <- train |>
+  group_by(league) |>
+  group_split() |>
+  map(function(league_df) {
+    folds <- sliding_period(
+      arrange(league_df, dateutc),
+      index    = dateutc,
+      period   = "month",
+      lookback = 3,
+      assess_stop = 1
+    )
+    mutate(folds, fold_id = row_number())
+  })
+```
+
+This produces 5 folds (`fold1.fst` – `fold5.fst`), each containing a `cv_role` column (`"train"` or `"test"`) to distinguish the analysis and assessment windows within that fold.
+
+
+# Exploratory Data Analysis
+
+## Response Variable
+
+The response variable is counts of goals remaining for each side. These are heavily right-skewed (most of the time, teams score 0–2 more goals), with distributions varying somewhat by competition.
+
+```{r resp-dist}
+#| eval: true
+#| echo: false
+#| fig-cap: "Distribution of goals remaining at each event, split by home/away and competition."
+knitr::include_graphics(here("plots", "goals_remaining_dist.png"))
+```
+
+## Cumulative Event Counts vs Total Goals
+
+More shots and corner kicks appear to be associated with higher-scoring matches, with the relationship varying by league.
+
+```{r home-counts}
+#| eval: true
+#| echo: false
+#| fig-cap: "Smoothed mean total home goals as a function of each cumulative home event count, by league."
+knitr::include_graphics(here("plots", "home_counts_vs_goals.png"))
+```
+
+```{r away-counts}
+#| eval: true
+#| echo: false
+#| fig-cap: "Smoothed mean total away goals as a function of each cumulative away event count, by league."
+knitr::include_graphics(here("plots", "away_counts_vs_goals.png"))
+```
+
+## Pairwise Correlations Between Home Event Counts
+
+The pair plot below (sampled to n = 5,000 for speed) shows pairwise relationships between the first five cumulative home count variables. Most count variables are moderately positively correlated, likely due to the fact that counts are agregated over time (e.g shot counts aggregate over the game, and so do passes, so higher shot counts implies more passes).
+```{r pairs}
+#| eval: true
+#| echo: false
+#| fig-cap: "Pairwise scatterplot matrix of the first five cumulative home event count variables (n = 5 000 sample), coloured by league."
+knitr::include_graphics(here("plots", "pairs_home_counts.png"))
+```
+
+## Missing Data Patterns
+
+Some of the missingness in the dataset (player/team performance metrics in particular are due to lack of player histories in the dataset for early season games. There was already some missingness already present before that, which we would like to explore here.
+
+**Temporal pattern.** The proportion of missing EWMA values peaks sharply at the start of each competition's season and decays as ratings accumulate, which is expected.
+
+```{r missing-temporal}
+#| eval: true
+#| echo: false
+#| fig-cap: "Proportion of events with missing EWMA rank over time. Spikes correspond to season openers when few players have prior ratings."
+knitr::include_graphics(here("plots", "missing_temporal.png"))
+```
+
+**League-level variation.** The proportion of missing EWMA values varies across leagues among non-debut players, likely reflecting differences in squad turnover and coverage in the PlayeRank dataset.
+
+```{r missing-league}
+#| eval: true
+#| echo: false
+#| fig-cap: "EWMA rank missingness rate by league, restricted to non-debut players."
+knitr::include_graphics(here("plots", "missing_by_league.png"))
+```
+
+**Event-level variation.** The proportion of missing EWMA values does not apear to depend on the included event types.
+```{r missing-mar}
+#| eval: true
+#| echo: false
+#| fig-cap: "Cumulative home event counts by EWMA missingness status, restricted to non-debut players (n = 50 000 sample). Similar distributions across groups are consistent with a MAR assumption."
+knitr::include_graphics(here("plots", "missing_mar.png"))
+```
+
+------------------------------------------------------------------------
+
+# Imputation
+
+The EWMA-derived team strength features (`{home,away}MeanStr`, `{home,away}MinStr`, `{home,away}MaxStr`, `{home,away}Balance`) are missing for matches where at least 4 starters had no prior rating — predominantly season-opening matches and matches featuring players new to the dataset. For the rest, we saw that missingness might have been related to `league`. I'm not entirely sure if this data is missing at random, my approach will be to use multiple imputation, and compare estimates.  
+
+## Scaling
+
+Before imputation, numeric predictors are standardized using training-fold statistics only (mean and SD from the analysis split).
+
+```{r scaling}
+cols       <- setdiff(names(fold_T)[sapply(fold_T, is.numeric)],
+                      c("home_goals_remaining", "away_goals_remaining"))
+scaled_mat <- scale(as.matrix(fold_T[, .SD, .SDcols = cols]))
+fold_T[, (cols) := as.data.table(scaled_mat)]
+fold_V[, (cols) := as.data.table(scale(
+  as.matrix(fold_V[, .SD, .SDcols = cols]),
+  center = attr(scaled_mat, "scaled:center"),
+  scale  = attr(scaled_mat, "scaled:scale")
+))]
+```
+
+
+## Multiple Imputation with MICE
+
+NOTE!!!! I didn't get the chance to do multiple imputation with mice just yet. I'd like to do a sensitivity analysis as well once I get the chance. For now I've used `mice` with just single impuation (`m = 1`).  
+
+
+# Model Fitting
+
+## Model Specification
+NOTE!!! For computational purposes I DID NOT include league interaction terms, though from our EDA earlier it is ideal to include them. I'll refit this later with these interactions (the `by` aregument in `s()`) when I get the chance. 
+
+
+Two independent GAMs are fit — one for `home_goals_remaining` and one for `away_goals_remaining` using the same model string. Equivalently, we assume that `home_goals_remaining` and `away_goals_remaining` are conditionally independent given the state of play information discuessed earlier, and that their conditional expecations are parameterized in an equivalent fashion. 
+
+Each model is estimated via `mgcv::bam()` with `discrete = TRUE` for computational efficiency and `select = TRUE`. The away model formula (the home model is identical in structure) is:
+
+```{r bam-formula}
+away_goals_remaining ~
+  s(count_home_others_on_the_ball, k = 7) + s(count_home_pass, k = 7) +
+  s(count_home_duel, k = 7) + s(count_home_foul, k = 7) +
+  s(count_home_free_kick, k = 7) + s(count_home_shot, k = 7) +
+  s(count_home_offside, k = 7) + s(count_home_corner_kick, k = 7) +
+  s(count_away_others_on_the_ball, k = 7) + s(count_away_pass, k = 7) +
+  s(count_away_duel, k = 7) + s(count_away_foul, k = 7) +
+  s(count_away_free_kick, k = 7) + s(count_away_shot, k = 7) +
+  s(count_away_offside, k = 7) + s(count_away_corner_kick, k = 7) +
+  s(home_mean_str, k = 7) + s(home_min_str, k = 7) +
+  s(home_max_str, k = 7) + s(home_balance, k = 7) +
+  s(away_mean_str, k = 7) + s(away_min_str, k = 7) +
+  s(away_max_str, k = 7) + s(away_balance, k = 7) +
+  league + match_period +
+  s(pos_orig_x, pos_orig_y, bs = "gp") + s(pos_dest_x, pos_dest_y, bs = "gp") +
+  s(event_sec, k = 7) + s(current_home_score, k = 7) + s(current_away_score, k = 7)
+```
+
+Each spline $s(\cdot)$ uses $k = 7$. The spatial terms use a Gaussian Process smooth (`bs = "gp"`) over the origin and destination coordinates. 
+
+
+## Evaluation Metric
+
+Model performance is measured by **cross validated mean Poisson deviance** on the validation set(s).
+
+$$D = \frac{1}{n}\sum_{i=1}^n 2\left(y_i \log\frac{y_i}{\hat{\mu}_i} - (y_i - \hat{\mu}_i)\right)$$
+  
+### Results
+
+Reported below is the poisson deviance of the test set. 
+```{r results-table}
+#| eval: false
+poisson_dev <- function(y, mu) mean(2 * (ifelse(y == 0, 0, y * log(y / mu)) - (y - mu)))
+```
+
+| Response | Test Poisson Deviance |
+|---|---|
+| Home goals remaining | 1.098 |
+| Away goals remaining | 0.998 |
+
+
+### Model Interepretation (TO DO)
+
